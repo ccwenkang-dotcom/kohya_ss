@@ -5,13 +5,14 @@ import shutil
 import datetime
 import subprocess
 import re
-import pkg_resources
+import importlib.metadata
+
 
 log = logging.getLogger("sd")
 
 # Constants
 MIN_PYTHON_VERSION = (3, 10, 9)
-MAX_PYTHON_VERSION = (3, 13, 0)
+MAX_PYTHON_VERSION = (3, 14, 0)
 LOG_DIR = "../logs/setup/"
 LOG_LEVEL = "INFO" # Set to "INFO" or "WARNING" for less verbose logging
 
@@ -31,7 +32,9 @@ def check_python_version():
             log.error(
                 f"The current version of python ({sys.version}) is not supported."
             )
-            log.error("The Python version must be >= 3.10.9 and < 3.13.0.")
+            supported_min = _format_python_version(MIN_PYTHON_VERSION)
+            supported_max = _format_python_version(MAX_PYTHON_VERSION)
+            log.error(f"The Python version must be >= {supported_min} and < {supported_max}.")
             return False
         return True
     except Exception as e:
@@ -552,6 +555,54 @@ def pip(arg: str, ignore: bool = False, quiet: bool = False, show_stdout: bool =
         return txt
 
 
+def _format_python_version(version_tuple):
+    return ".".join(str(part) for part in version_tuple)
+
+
+def _resolve_installed_version(package_name):
+    candidate_names = (
+        package_name,
+        package_name.lower(),
+        package_name.replace("_", "-"),
+    )
+
+    for candidate in candidate_names:
+        try:
+            return importlib.metadata.version(candidate)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+
+    raise importlib.metadata.PackageNotFoundError(package_name)
+
+
+def _parse_version_for_compare(version_string):
+    try:
+        from packaging.version import Version
+
+        return Version(version_string)
+    except Exception:
+        # Keep setup bootstrap-safe even if packaging is not available yet.
+        tokens = []
+        for part in re.split(r"[._+-]", version_string):
+            if not part:
+                continue
+            token = (0, int(part)) if part.isdigit() else (1, part.lower())
+            tokens.append(token)
+        return tuple(tokens)
+
+
+def _version_satisfies(installed_version, required_version, operator):
+    installed_parsed = _parse_version_for_compare(installed_version)
+    required_parsed = _parse_version_for_compare(required_version)
+
+    if operator == ">=":
+        return installed_parsed >= required_parsed
+    if operator == "==":
+        return installed_parsed == required_parsed
+
+    raise ValueError(f"Unsupported version operator: {operator}")
+
+
 def installed(package, friendly: str = None):
     """
     Checks if the specified package(s) are installed with the correct version.
@@ -594,54 +645,38 @@ def installed(package, friendly: str = None):
 
         for pkg in pkgs:
             # Parse the package name and version based on the version specifier used
+            version_operator = None
             if ">=" in pkg:
-                pkg_name, pkg_version = [x.strip() for x in pkg.split(">=")]
+                pkg_name, pkg_version = [x.strip() for x in pkg.split(">=", 1)]
+                version_operator = ">="
             elif "==" in pkg:
-                pkg_name, pkg_version = [x.strip() for x in pkg.split("==")]
+                pkg_name, pkg_version = [x.strip() for x in pkg.split("==", 1)]
+                version_operator = "=="
             else:
                 pkg_name, pkg_version = pkg.strip(), None
 
-            # Attempt to find the installed package by its name
-            spec = pkg_resources.working_set.by_key.get(pkg_name, None)
-            if spec is None:
-                # Try again with lowercase name
-                spec = pkg_resources.working_set.by_key.get(pkg_name.lower(), None)
-            if spec is None:
-                # Try replacing underscores with dashes
-                spec = pkg_resources.working_set.by_key.get(
-                    pkg_name.replace("_", "-"), None
-                )
-
-            if spec is not None:
-                # Package is found, check version
-                version = pkg_resources.get_distribution(pkg_name).version
+            try:
+                version = _resolve_installed_version(pkg_name)
                 log.debug(f"Package version found: {pkg_name} {version}")
 
-                if pkg_version is not None:
-                    # Verify if the installed version meets the specified constraints
-                    if ">=" in pkg:
-                        ok = version >= pkg_version
-                    else:
-                        ok = version == pkg_version
-
-                    if not ok:
-                        # Version mismatch, log warning and return False
-                        log.warning(
-                            f"Package wrong version: {pkg_name} {version} required {pkg_version}"
-                        )
-                        return False
-            else:
+                if pkg_version is not None and not _version_satisfies(
+                    version, pkg_version, version_operator
+                ):
+                    log.warning(
+                        f"Package wrong version: {pkg_name} {version} required {pkg_version}"
+                    )
+                    return False
+            except importlib.metadata.PackageNotFoundError:
                 # Package not found, log debug message and return False
                 log.debug(f"Package version not found: {pkg_name}")
                 return False
 
         # All specified packages are installed with the correct versions
         return True
-    except ModuleNotFoundError:
+    except Exception:
         # One or more packages are not installed, log debug message and return False
-        log.debug(f"Package not installed: {pkgs}")
+        log.debug(f"Package check failed: {pkgs}")
         return False
-
 
 # install package using pip if not already installed
 def install(
@@ -778,3 +813,4 @@ def clear_screen():
     except Exception as e:
         log.error("Error occurred while clearing the terminal screen")
         log.error(f"Error: {e}")
+
